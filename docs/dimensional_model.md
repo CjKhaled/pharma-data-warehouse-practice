@@ -260,7 +260,7 @@ make drill-across queries possible.
 
 ## 7. Star Schema
 
-*Diagram to be generated from schema.sql in Phase 2 and inserted here as er_diagram.png*
+![ER Diagram](er_diagram.png)
 
 ---
 
@@ -279,3 +279,4 @@ A record of every meaningful design choice made and the alternative that was rej
 | Low-cardinality flags | Junk dimension | Individual flag columns | Four flag columns in the fact table would clutter the schema with Y/N codes; junk dimension reduces to one foreign key |
 | Territory hierarchy | Fixed-depth columns | Recursive parent-child | Fixed-depth makes every level directly queryable; recursive structure requires CTEs for every hierarchy traversal |
 | Aggregate fact table | Territory-month rollup | Index only | Pre-aggregated table eliminates full table scans for district-level trend queries entirely, not just speeds them up |
+|Load Pattern | Batch ETL | Real-time streaming | All three source systems operate on batch schedules — Rx data weekly, CRM nightly, quota quarterly. Streaming infrastructure would add complexity with no analytical benefit given source latency |
