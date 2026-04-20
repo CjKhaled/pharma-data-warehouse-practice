@@ -649,45 +649,44 @@ def generate_fct_hcp_visit(f, notes_pool_size):
 def generate_fct_prescription_weekly(f):
     write(f, '\n-- ── fct_prescription_weekly ────────────────────────────────────────────')
     write(f, '-- Note: Dr. James Okafor (hcp_key=5) has a visible Rx drop weeks of 2023-08-06 to 2023-09-03')
-    write(f, '-- Note: BATCH-005 rows for week 2024-03-03 have dq_flag=superseded (vendor error)')
+    write(f, '-- Note: BATCH-005 rows for week 2024-03-03 have inflated units (35% vendor error)')
+    write(f, '-- Note: BATCH-006 rows for week 2024-03-10 are the corrected replacements')
+    write(f, '-- Note: week 2024-03-10 is reserved exclusively for corrected rows')
     write(f, 'INSERT INTO fct_prescription_weekly (week_end_date_key, hcp_key, product_key,')
     write(f, '    territory_key, group_key, audit_key, new_rx_count, total_rx_count,')
     write(f, '    total_units, brand_units, total_market_units, market_share_pct) VALUES')
 
-    # Collect all Sunday week-end dates in range
     week_ends = []
     d = DATE_START
     while d <= DATE_END:
-        if d.weekday() == 6:   # Sunday
+        if d.weekday() == 6:
             week_ends.append(d)
         d += timedelta(days=1)
 
     rows       = []
-    seen_grain = set()   # enforce UNIQUE (week_end_date_key, hcp_key, product_key, territory_key)
+    seen_grain = set()
 
-    # Product keys: 1=Keytruda, 3=Humira current, 4=Ozempic
-    # hcp_key=3 is Humira original (expired), so prescriptions use key 3 for Humira pre-Nov 2023
-    # and key 3 still for simplicity (product versioning handled in dim_product)
-    active_products = [1, 3, 4]   # Keytruda, Humira (current row), Ozempic
+    active_products = [1, 3, 4]
+    RESERVED_CORRECTION_WEEK = date(2024, 3, 10)
 
-    for hcp_key in range(1, NUM_HCPS + 2):   # +2 for the two Dr. Moore rows
-        # Assign territory and group_key
+    for hcp_key in range(1, NUM_HCPS + 2):
         ter_key   = ((hcp_key - 1) % 6) + 1
-        group_key = 1 if hcp_key == 4 else None   # Dr. Robert Kim is co-promoted
+        group_key = 1 if hcp_key == 4 else None
 
-        # Each HCP prescribes 1-3 products
         num_products = random.randint(1, 3)
         hcp_products = random.sample(active_products, min(num_products, len(active_products)))
 
         for prod_key in hcp_products:
-            # Base weekly prescription rate for this HCP-product
             base_new_rx    = random.randint(2, 60)
             base_total_rx  = int(base_new_rx * random.uniform(1.1, 1.8))
             base_units     = base_total_rx * random.randint(28, 90)
             base_mkt_units = int(base_units / random.uniform(0.05, 0.60))
 
             for week_end in week_ends:
-                # Skip ~30% of weeks for sparsity (not every HCP prescribes every week)
+                # Skip the reserved correction week — belongs to BATCH-006 only
+                if week_end == RESERVED_CORRECTION_WEEK:
+                    continue
+
                 if random.random() < 0.30:
                     continue
 
@@ -697,23 +696,24 @@ def generate_fct_prescription_weekly(f):
                 seen_grain.add(grain)
 
                 # ── Scenario: Dr. Okafor Rx drop ──
-                # hcp_key=5 is Dr. James Okafor (5th row in dim_hcp)
                 if hcp_key == 5 and prod_key == 1:
                     if RX_DROP_WEEK_START <= week_end <= RX_DROP_WEEK_END:
-                        new_rx   = random.randint(1, 8)
+                        new_rx = random.randint(1, 8)
                     else:
-                        new_rx   = random.randint(35, 55)
+                        new_rx = random.randint(35, 55)
                 else:
                     new_rx = max(0, int(base_new_rx * random.uniform(0.7, 1.3)))
 
+                total_rx = max(new_rx, int(new_rx * random.uniform(1.1, 1.8)))
+
                 # ── Scenario: superseded batch week ──
                 if week_end == date(2024, 3, 3):
-                    audit_key = 5   # BATCH-005 — corrected
+                    audit_key = 5   # BATCH-005 — superseded, inflated units
+                    units     = int(total_rx * random.randint(28, 90) * 1.35)
                 else:
                     audit_key = 2   # BATCH-002 — standard iqvia batch
+                    units     = total_rx * random.randint(28, 90)
 
-                total_rx  = max(new_rx, int(new_rx * random.uniform(1.1, 1.8)))
-                units     = total_rx * random.randint(28, 90)
                 mkt_units = int(units / random.uniform(0.05, 0.60))
                 mkt_share = round(units / mkt_units * 100, 2) if mkt_units > 0 else None
                 gk        = group_key if group_key else 'NULL'
@@ -724,6 +724,30 @@ def generate_fct_prescription_weekly(f):
                     f"{units}, {units}, {mkt_units}, "
                     f"{'NULL' if mkt_share is None else mkt_share})"
                 )
+
+    # ── Corrected rows for BATCH-006 ──
+    # Mirror the exact HCP-product-territory combinations from the superseded
+    # week (2024-03-03) so Query 9 joins correctly on shared keys.
+    # Week 2024-03-10 is reserved exclusively for these corrected rows.
+    for (week_end, hcp_key, prod_key, ter_key) in seen_grain:
+        if week_end != date(2024, 3, 3):
+            continue
+
+        group_key = 1 if hcp_key == 4 else None
+        gk        = group_key if group_key else 'NULL'
+
+        new_rx    = random.randint(2, 60)
+        total_rx  = max(new_rx, int(new_rx * random.uniform(1.1, 1.8)))
+        units     = total_rx * random.randint(28, 90)   # no inflation
+        mkt_units = int(units / random.uniform(0.05, 0.60))
+        mkt_share = round(units / mkt_units * 100, 2) if mkt_units > 0 else None
+
+        rows.append(
+            f"  ({esc(RESERVED_CORRECTION_WEEK)}, {hcp_key}, {prod_key}, {ter_key}, "
+            f"{gk}, 6, {new_rx}, {total_rx}, "
+            f"{units}, {units}, {mkt_units}, "
+            f"{'NULL' if mkt_share is None else mkt_share})"
+        )
 
     write(f, ',\n'.join(rows) + ';')
 

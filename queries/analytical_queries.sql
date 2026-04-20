@@ -113,11 +113,12 @@ ORDER BY
 --   investigating.
 -- Tables: fct_prescription_weekly, dim_hcp, dim_product, dim_date
 -- Scenario: Dr. James Okafor (hcp_key=5) shows a visible drop in
---           weeks of 2023-08-06 through 2023-09-03
+--           weeks of 2023-08-06 through 2023-09-03 plus 13 weeks before it
 -- ============================================================
 
-WITH weekly_rx AS (
-    -- Base prescription data with HCP and product context
+WITH filtered_rx AS (
+    -- Pull rows starting 13 weeks before the display window
+    -- so the rolling average has the historical data it needs
     SELECT
         p.week_end_date_key,
         p.hcp_key,
@@ -134,13 +135,17 @@ WITH weekly_rx AS (
     JOIN dim_product pr
         ON  p.product_key   = pr.product_key
         AND pr.is_current   = TRUE
-    WHERE h.segment IN ('A', 'B')   -- focus on high-value physicians
+    -- Start 13 weeks before the display window opens
+    -- This gives the rolling average its required lookback history
+    WHERE p.week_end_date_key BETWEEN '2023-03-05' AND '2023-10-01'
+      AND h.segment IN ('A', 'B')
 ),
 
 trend_calc AS (
-    -- Calculate rolling 13-week average and week-over-week change
     SELECT
         week_end_date_key,
+        hcp_key,
+        product_key,
         hcp_name,
         segment,
         decile_rank,
@@ -178,9 +183,11 @@ trend_calc AS (
                 ORDER BY week_end_date_key
             ), 0), 1
         )                       AS wow_pct_change
-    FROM weekly_rx
+    FROM filtered_rx
 )
 
+-- Display window filter applied here — after window functions have run
+-- Rows from March–May were needed for correct averages but are not shown
 SELECT
     week_end_date_key,
     hcp_name,
@@ -192,7 +199,6 @@ SELECT
     prior_week_rx,
     wow_change,
     wow_pct_change,
-    -- Flag significant drops for easy filtering
     CASE
         WHEN wow_pct_change < -30 THEN 'Significant drop'
         WHEN wow_pct_change < -10 THEN 'Moderate drop'
@@ -245,21 +251,21 @@ WITH attainment_ranked AS (
             100.0 * PERCENT_RANK() OVER (
                 PARTITION BY r.district, qa.product_key, qa.fiscal_quarter_key
                 ORDER BY qa.attainment_pct
-            ), 1
+            )::NUMERIC, 1
         )                               AS percentile_in_district,
 
         -- District average attainment for comparison
         ROUND(
             AVG(qa.attainment_pct) OVER (
                 PARTITION BY r.district, qa.product_key, qa.fiscal_quarter_key
-            ), 1
+            )::NUMERIC, 1
         )                               AS district_avg_attainment,
 
         -- Difference from district average
         ROUND(
             qa.attainment_pct - AVG(qa.attainment_pct) OVER (
                 PARTITION BY r.district, qa.product_key, qa.fiscal_quarter_key
-            ), 1
+            )::NUMERIC, 1
         )                               AS vs_district_avg
 
     FROM fct_quota_attainment qa
@@ -727,7 +733,7 @@ WITH superseded_rows AS (
     FROM fct_prescription_weekly p
     JOIN dim_audit a
         ON p.audit_key = a.audit_key
-    WHERE a.batch_id = 'BATCH-005'
+    WHERE a.batch_id = 'BATCH-005' AND p.week_end_date_key = '2024-03-03'
 ),
 
 corrected_rows AS (
@@ -742,7 +748,7 @@ corrected_rows AS (
     FROM fct_prescription_weekly p
     JOIN dim_audit a
         ON p.audit_key = a.audit_key
-    WHERE a.batch_id = 'BATCH-006'
+    WHERE a.batch_id = 'BATCH-006' AND p.week_end_date_key = '2024-03-10'
 )
 
 SELECT
@@ -969,47 +975,62 @@ ORDER BY
 --           (product_key=2 original, product_key=3 expanded)
 -- ============================================================
 
-WITH humira_rx AS (
+WITH humira_keys AS (
     SELECT
-        p.week_end_date_key,
+        product_key,
+        product_code,
+        indication,
+        effective_date          AS indication_effective_date
+    FROM dim_product
+    WHERE brand_name = 'Humira'
+      AND is_current = TRUE
+),
+
+-- Aggregate on integer keys only -- no strings enter the sort
+pre_agg AS (
+    SELECT
         p.hcp_key,
-        h.full_name             AS hcp_name,
-        h.specialty,
-        h.segment,
-        pr.indication,
-        pr.effective_date       AS indication_effective_date,
-        p.total_rx_count,
-        p.new_rx_count,
-        CASE
-            WHEN pr.product_code = 'PRD-HUM-001' THEN 'Pre-expansion'
-            WHEN pr.product_code = 'PRD-HUM-002' THEN 'Post-expansion'
-        END                     AS indication_period
+        p.product_key,
+        SUM(p.total_rx_count)                   AS total_rx,
+        SUM(p.new_rx_count)                     AS total_new_rx,
+        COUNT(DISTINCT p.week_end_date_key)      AS weeks_of_data,
+        -- Carry the per-hcp weekly average forward so the summary
+        -- level AVG is taken over HCPs, not over raw weekly rows
+        SUM(p.total_rx_count) * 1.0
+            / NULLIF(COUNT(DISTINCT p.week_end_date_key), 0)
+                                                AS avg_weekly_rx
     FROM fct_prescription_weekly p
-    JOIN dim_product pr
-        ON p.product_key = pr.product_key
-    JOIN dim_hcp h
-        ON  p.hcp_key    = h.hcp_key
-        AND h.is_current = TRUE
-    WHERE pr.brand_name = 'Humira'
+    WHERE p.product_key IN (SELECT product_key FROM humira_keys)
+    GROUP BY p.hcp_key, p.product_key
 ),
 
 period_summary AS (
     SELECT
-        indication_period,
-        indication,
-        indication_effective_date,
-        specialty,
-        COUNT(DISTINCT hcp_key)             AS unique_prescribers,
-        COUNT(DISTINCT week_end_date_key)   AS weeks_of_data,
-        SUM(total_rx_count)                 AS total_rx,
-        ROUND(AVG(total_rx_count), 1)       AS avg_weekly_rx_per_hcp,
-        SUM(new_rx_count)                   AS total_new_rx
-    FROM humira_rx
+        CASE
+            WHEN k.product_code = 'PRD-HUM-001' THEN 'Pre-expansion'
+            WHEN k.product_code = 'PRD-HUM-002' THEN 'Post-expansion'
+        END                                     AS indication_period,
+        k.indication,
+        k.indication_effective_date,
+        h.specialty,
+        COUNT(DISTINCT a.hcp_key)               AS unique_prescribers,
+        -- SUM is correct here: each hcp/product row already holds
+        -- that HCP's week count, so summing gives total across HCPs
+        SUM(a.weeks_of_data)                    AS weeks_of_data,
+        SUM(a.total_rx)                         AS total_rx,
+        SUM(a.total_new_rx)                     AS total_new_rx,
+        -- Average of per-HCP weekly averages -- semantically equivalent
+        -- to the original avg_weekly_rx_per_hcp
+        ROUND(AVG(a.avg_weekly_rx), 1)          AS avg_weekly_rx_per_hcp
+    FROM pre_agg a
+    JOIN humira_keys k  ON  a.product_key   = k.product_key
+    JOIN dim_hcp h      ON  a.hcp_key       = h.hcp_key
+                        AND h.is_current    = TRUE
     GROUP BY
         indication_period,
-        indication,
-        indication_effective_date,
-        specialty
+        k.indication,
+        k.indication_effective_date,
+        h.specialty
 )
 
 SELECT
@@ -1022,13 +1043,12 @@ SELECT
     total_rx,
     avg_weekly_rx_per_hcp,
     total_new_rx,
-    -- Compare to prior period using LAG
     ROUND(
         avg_weekly_rx_per_hcp - LAG(avg_weekly_rx_per_hcp) OVER (
             PARTITION BY specialty
             ORDER BY indication_effective_date
         ), 1
-    )                           AS avg_rx_change_vs_prior,
+    )                                           AS avg_rx_change_vs_prior,
     ROUND(
         100.0 * (avg_weekly_rx_per_hcp - LAG(avg_weekly_rx_per_hcp) OVER (
             PARTITION BY specialty
@@ -1037,7 +1057,7 @@ SELECT
             PARTITION BY specialty
             ORDER BY indication_effective_date
         ), 0), 1
-    )                           AS avg_rx_pct_change
+    )                                           AS avg_rx_pct_change
 FROM period_summary
 ORDER BY
     specialty,
