@@ -39,7 +39,7 @@ The challenge these stakeholders share is not access to raw data. It is the abse
 
 ## Warehouse Diagram
 
-![ER Diagram](er_diagram.png)
+![ER Diagram](/docs/er_diagram.png)
 
 ---
 
