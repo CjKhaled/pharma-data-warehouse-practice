@@ -1,8 +1,8 @@
 -- ============================================================
 -- Query N: [Business Question]
 -- Tables: [which fact and dimension tables are used]
--- Scenario: [which seed data scenario this demonstrates]
 -- ============================================================
+
 
 -- ============================================================
 -- Query 1: Below-quota rep coverage analysis
@@ -11,14 +11,13 @@
 --   wrong ones? This query identifies reps below 80% attainment
 --   and checks whether their A-tier physicians — the highest
 --   prescribing potential targets — are being visited or ignored.
+--   Total visit volume is included alongside A-tier coverage to
+--   distinguish effort problems from targeting problems.
 -- Tables: fct_quota_attainment, fct_hcp_visit, fct_hcp_coverage_target,
---         dim_rep, dim_hcp, dim_date
--- Scenario: Sarah Chen (rep_key=1) misses quota AND undercovering A-tier HCPs
---           Marcus Williams (rep_key=2) misses quota but coverage is strong
+--         dim_rep, dim_hcp, dim_product, dim_date
 -- ============================================================
 
 WITH below_quota_reps AS (
-    -- Identify reps below 80% attainment in FQ1 FY2024
     SELECT
         qa.rep_key,
         r.rep_name,
@@ -40,8 +39,22 @@ WITH below_quota_reps AS (
       AND qa.attainment_pct     < 80.0
 ),
 
+total_visits AS (
+    -- Total visits made by each below-quota rep during FQ1 FY2024
+    -- regardless of HCP tier — answers "are they visiting enough"
+    SELECT
+        v.rep_key,
+        COUNT(*)                        AS total_visits_in_quarter,
+        COUNT(DISTINCT v.hcp_key)       AS unique_hcps_visited
+    FROM fct_hcp_visit v
+    JOIN dim_date d
+        ON  v.date_key        = d.date_key
+    WHERE d.fiscal_quarter    = 1
+      AND d.fiscal_year       = 2024
+    GROUP BY v.rep_key
+),
+
 coverage_targets AS (
-    -- Pull A-tier HCP assignments for those reps
     SELECT
         ct.rep_key,
         ct.hcp_key,
@@ -57,7 +70,6 @@ coverage_targets AS (
 ),
 
 actual_visits AS (
-    -- Count visits made to those A-tier HCPs during FQ1 FY2024
     SELECT
         v.rep_key,
         v.hcp_key,
@@ -65,9 +77,9 @@ actual_visits AS (
         COUNT(*)        AS visit_count
     FROM fct_hcp_visit v
     JOIN dim_date d
-        ON  v.date_key     = d.date_key
-    WHERE d.fiscal_quarter = 1
-      AND d.fiscal_year    = 2024
+        ON  v.date_key        = d.date_key
+    WHERE d.fiscal_quarter    = 1
+      AND d.fiscal_year       = 2024
     GROUP BY v.rep_key, v.hcp_key, v.product_key
 )
 
@@ -76,21 +88,27 @@ SELECT
     bq.current_territory_name,
     bq.brand_name,
     bq.attainment_pct,
+    -- Total effort metrics
+    COALESCE(tv.total_visits_in_quarter, 0)     AS total_visits_in_quarter,
+    COALESCE(tv.unique_hcps_visited, 0)         AS unique_hcps_visited,
+    -- A-tier coverage metrics
     ct.hcp_name,
     ct.segment,
-    COALESCE(av.visit_count, 0)                         AS visits_made,
+    COALESCE(av.visit_count, 0)                 AS visits_made,
     CASE
         WHEN COALESCE(av.visit_count, 0) = 0 THEN 'No visits'
         WHEN av.visit_count              < 2  THEN 'Undercovered'
         ELSE                                       'Adequately covered'
-    END                                                 AS coverage_status,
+    END                                         AS coverage_status,
     ROUND(
         100.0 * SUM(CASE WHEN COALESCE(av.visit_count, 0) = 0 THEN 1 ELSE 0 END)
             OVER (PARTITION BY bq.rep_key, bq.product_key)
         / COUNT(*) OVER (PARTITION BY bq.rep_key, bq.product_key),
         1
-    )                                                   AS pct_a_tier_unvisited
+    )                                           AS pct_a_tier_unvisited
 FROM below_quota_reps bq
+LEFT JOIN total_visits tv
+    ON  bq.rep_key = tv.rep_key
 JOIN coverage_targets ct
     ON  bq.rep_key     = ct.rep_key
     AND bq.product_key = ct.product_key
@@ -636,77 +654,7 @@ ORDER BY
 
 
 -- ============================================================
--- Query 8: Timespan tracking — flat quota identification
--- Business question: Which reps have been carrying the same quota
---   for multiple consecutive quarters without any adjustment?
---   Finance uses this to identify quotas that may need revisiting
---   — a rep whose territory has grown but whose quota hasn't
---   changed in three quarters is likely being undercharged.
--- Tables: fct_quota_attainment, dim_rep, dim_product
--- Scenario: Lisa Nguyen (rep_key=5) carries flat Ozempic quota
---           of 500 units across FQ1/FQ2/FQ3 FY2024 — one row
---           with a wide effective date span instead of three rows
--- ============================================================
-
-WITH quota_spans AS (
-    SELECT
-        r.rep_name,
-        r.current_territory_name,
-        r.district,
-        p.brand_name,
-        qa.quota_units,
-        qa.actual_units,
-        qa.attainment_pct,
-        qa.effective_date,
-        qa.expiration_date,
-        qa.is_current,
-        -- How many fiscal quarters does this quota span?
-        CASE
-            WHEN qa.expiration_date IS NULL THEN
-                -- Still active — calculate quarters from effective date to today
-                EXTRACT(YEAR FROM AGE(CURRENT_DATE, qa.effective_date)) * 4
-                + ROUND(EXTRACT(MONTH FROM AGE(CURRENT_DATE, qa.effective_date)) / 3)
-            ELSE
-                EXTRACT(YEAR FROM AGE(qa.expiration_date, qa.effective_date)) * 4
-                + ROUND(EXTRACT(MONTH FROM AGE(qa.expiration_date, qa.effective_date)) / 3)
-        END                     AS quarters_at_this_quota
-    FROM fct_quota_attainment qa
-    JOIN dim_rep r
-        ON  qa.rep_key    = r.rep_key
-        AND r.is_current  = TRUE
-    JOIN dim_product p
-        ON  qa.product_key   = p.product_key
-        AND p.is_current     = TRUE
-)
-
-SELECT
-    rep_name,
-    current_territory_name,
-    district,
-    brand_name,
-    quota_units,
-    effective_date,
-    expiration_date,
-    is_current,
-    quarters_at_this_quota,
-    -- Average actual units during this quota span
-    ROUND(actual_units, 0)      AS actual_units_latest_period,
-    attainment_pct,
-    CASE
-        WHEN quarters_at_this_quota >= 3 THEN 'Quota review recommended'
-        WHEN quarters_at_this_quota  = 2 THEN 'Monitor'
-        ELSE                                  'Recently adjusted'
-    END                         AS quota_review_flag
-FROM quota_spans
-WHERE quarters_at_this_quota >= 2
-ORDER BY
-    quarters_at_this_quota DESC,
-    district,
-    rep_name;
-
-
--- ============================================================
--- Query 9: Data quality audit — superseded batch investigation
+-- Query 8: Data quality audit — superseded batch investigation
 -- Business question: When the Rx vendor sends a corrected file,
 --   which rows were affected, what changed, and can we quantify
 --   the magnitude of the vendor error? This query uses the audit
@@ -786,7 +734,7 @@ ORDER BY
 
 
 -- ============================================================
--- Query 10: Market share trend by territory
+-- Query 9: Market share trend by territory
 -- Business question: How is our brand's market share moving
 --   month over month across territories? Which territories are
 --   gaining share and which are losing it? This query uses the
@@ -898,7 +846,7 @@ ORDER BY
 
 
 -- ============================================================
--- Query 11: HCP decile ranking writeback validation
+-- Query 10: HCP decile ranking writeback validation
 -- Business question: Are the decile rankings stored in dim_hcp
 --   actually consistent with observed prescription volume? This
 --   query recalculates decile rankings from actual Rx data using
@@ -964,7 +912,7 @@ ORDER BY
 
 
 -- ============================================================
--- Query 12: Product indication expansion impact
+-- Query 11: Product indication expansion impact
 -- Business question: After Humira received FDA approval for a
 --   second indication, did prescription volume increase? This
 --   query uses the Type 2 SCD history on dim_product to split

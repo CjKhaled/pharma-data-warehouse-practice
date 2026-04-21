@@ -174,28 +174,7 @@
 
 ---
 
-## Query 8: Flat quota identification
-
-### EXPLAIN ANALYZE
-
-- **Execution Time:** 1.870 ms
-- **Planning Time:** 0.384 ms
-- **Buffers:** shared hit=14 (all cache, no disk reads)
-
-#### Plan summary
-
-| Node | Detail |
-|---|---|
-| Sort | By quarters_at_this_quota DESC, district, rep_name — quicksort, 88kB |
-| Hash Join | Joins fct_quota_attainment to dim_rep on rep_key |
-| Nested Loop | Joins quota rows to dim_product |
-| Seq Scan — fct_quota_attainment | Full scan of 457 rows — filter is a computed expression using AGE() |
-| Memoize — dim_product | 454 hits, 3 misses |
-| Seq Scan — dim_rep | 51 rows scanned, 1 removed by is_current |
-
----
-
-## Query 9: Data quality audit — superseded batch investigation
+## Query 8: Data quality audit — superseded batch investigation
 
 ### EXPLAIN ANALYZE
 
@@ -218,7 +197,7 @@
 
 ---
 
-## Query 10: Market share trend by territory
+## Query 8: Market share trend by territory
 
 ### EXPLAIN ANALYZE
 
@@ -244,7 +223,7 @@
 
 ---
 
-## Query 11: HCP decile ranking writeback validation
+## Query 10: HCP decile ranking writeback validation
 
 ### EXPLAIN ANALYZE
 
@@ -269,26 +248,30 @@
 
 ---
 
-## Query 12: Product indication expansion impact
+## Query 11: Product indication expansion impact
 
 ### EXPLAIN ANALYZE
 
-- **Execution Time:** 81.112 ms
-- **Planning Time:** 0.300 ms
-- **Buffers:** shared hit=1155 + **temp read=475, written=476** (spilled to disk)
+- **Execution Time:** 36.946 ms
+- **Planning Time:** 1.346 ms
+- **Buffers:** shared hit=1,172 (all cache, no disk reads — disk spill eliminated)
 
 #### Plan summary
 
 | Node | Detail |
 |---|---|
 | WindowAgg | LAG for avg_rx_change_vs_prior_period |
-| Sort | By specialty, indication_effective_date |
+| Sort | By specialty, indication_effective_date — quicksort, 25kB |
 | GroupAggregate | Groups by indication_period, indication, specialty |
-| Sort | By tier_period, brand_name, specialty, hcp_key — **external merge, 3800kB spilled to disk** |
-| Hash Join — hcp | Joins prescription rows to dim_hcp |
-| Hash Join — product | Filters to Humira rows only (2 product versions) |
-| Seq Scan — fct_prescription_weekly | Full scan of 110,502 rows |
-| Seq Scan — dim_product | 4 rows scanned, 2 removed → 2 Humira versions |
+| Sort | By indication_period, specialty, hcp_key — quicksort, **72kB** (was 3,800kB) |
+| Hash Join — product | Joins GroupAggregate results to humira_keys CTE |
+| Hash Join — hcp | Joins filtered prescription rows to dim_hcp |
+| GroupAggregate (inner) | Pre-aggregates by hcp_key, product_key before joining |
+| Sort | By hcp_key, product_key, week_end_date_key — quicksort, 2,952kB |
+| Hash Semi Join | Filters fct_prescription_weekly to Humira product keys only |
+| Seq Scan — fct_prescription_weekly | 111,300 rows scanned, 75,073 removed → 36,227 Humira rows |
+| CTE Scan — humira_keys | 1 row — Humira product_key lookup |
+| Seq Scan — dim_product | 4 rows scanned, 3 removed by is_current + brand filter → 1 row |
 | Seq Scan — dim_hcp | 501 rows scanned, 1 removed by is_current |
 
 # Baseline Summary
@@ -302,31 +285,12 @@
 | Q5 — Co-promotion credit | 7.889 ms | None | **Needs index** |
 | Q6 — Tier upgrade impact | 1.931 ms | None | Acceptable |
 | Q7 — YoY comparison | 0.564 ms | None | Acceptable |
-| Q8 — Flat quota | 1.870 ms | None | Acceptable |
-| Q9 — Audit investigation | 4.055 ms | None | Acceptable |
-| Q10 — Market share trend | 1.653 ms | None | Acceptable |
-| Q11 — Decile validation | 21.499 ms | None | Intentional full scan |
-| Q12 — Indication expansion | 81.112 ms | **Disk spill** | **Needs index** |
+| Q8 — Audit investigation | 4.055 ms | None | Acceptable |
+| Q9 — Market share trend | 1.653 ms | None | Acceptable |
+| Q10 — Decile validation | 21.499 ms | None | Intentional full scan |
+| Q11 — Indication expansion | 36.946 ms | None | Acceptable |
 
 ## Key Findings
-
-Query 2 and Query 12 are the only queries with execution times above 50ms.
-They trace back to different root causes.
-
-Query 2 originally took 100ms because the date filter was placed in the final
-SELECT, after the window functions had already run across the full dataset.
-Refactoring the query to pre-filter rows before the window functions reduced
-execution time by 41%, eliminated parallel workers, and cut sort memory by
-62%. The pre-filter window starts 13 weeks before the display window opens to
-preserve correct rolling average history.
-
-Query 12 takes 81ms and is the only query in the set that spills to disk. The
-sort of 38,251 rows for the GroupAggregate exceeded PostgreSQL's `work_mem`
-allocation and wrote 3.8MB of temporary files to disk. The full table scan
-feeds all Humira rows — across both product versions — into the sort before
-any aggregation occurs. An index on `(product_key)` would reduce the rows
-entering the sort from 110,502 to only the Humira rows, potentially
-eliminating the spill entirely.
 
 Query 5 executes in 7.889ms which looks acceptable, but the plan reveals it
 scans 110,283 rows to return 219. That is a 99.8% rejection rate. At this data
@@ -336,7 +300,7 @@ a real pharma company — this query would scan one million rows to return
 roughly 2,000. The same index on `(hcp_key, week_end_date_key)` that fixes
 Query 2 will fix this structural problem before it becomes observable.
 
-Query 11 runs in 21.499ms and scans all 110,502 prescription rows. This is
+Query 10 runs in 21.499ms and scans all 110,502 prescription rows. This is
 correct and expected. The query computes NTILE(10) rankings across the entire
 physician population — it needs every row to produce accurate decile
 assignments.
@@ -362,7 +326,7 @@ full date range across all physicians first, then filter for physician 4 —
 turning the HCP equality condition into a filter predicate instead of an
 access predicate. The result: 272 pages read to return the same 112 rows.
 
----
+
 
 
 
